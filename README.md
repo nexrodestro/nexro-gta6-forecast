@@ -8,19 +8,18 @@ Forecasts GTA VI's launch-day Twitch concurrent viewers hour by hour: for each o
 
 ## Model
 
-The shape of a launch day depends on how big hour 1 already is. Tiny hour-1 launches ramp 10–1000×; mega launches (hour-1 ≥ 300k) dip to ~half of hour 1 by hours 9–10, then rise to ~1.1× in the evening (hours 17–19) and ease off. Two estimators of each hour's log-ratio to hour 1 are blended (mean of log-medians, wider of the two spreads):
+The shape of a launch day depends on how big hour 1 already is. Tiny hour-1 launches ramp 10–1000×; mega launches (hour-1 ≥ 300k) dip to ~half of hour 1 by hours 9–10, then rise to ~1.1× in the evening (hours 17–19) and ease off. Each hour's median log-ratio to hour 1 comes from a quadratic log-linear regression of log(v_h / v_1) on log10(v_1) across the case's comparables — captures the size-dependent ramp and saturates at the top end (a GTA VI hour 1 above the biggest comparable, 875k, uses the top-end shape instead of extrapolating down). The spread is max(quad residual spread, size-kNN neighbour spread) × 0.55, floored at 0.10 log units: the raw residual spread was far too wide (practice 90% coverage was 4/4 at every hour), and 0.55× is the value that won on practice, leave-one-out overall, big launches and console-midnight launches alike.
 
-1. a quadratic log-linear regression of log(v_h / v_1) on log10(v_1) across the case's comparables — captures the size-dependent ramp and saturates at the top end;
-2. size-kNN: the median log-ratio of the 8 comparables whose hour-1 is closest in log terms — captures the mega-launch U-shape directly.
-
-Quantiles: q_tau(h) = p1 · exp(median_h + z_tau · spread_h), z = −1.645/−0.674/0/0.674/1.645, spread floored at 0.10 log units. Only the case's hour-1 print and its comparables are used; the program runs offline, deterministically, stdlib only.
+Quantiles: q_tau(h) = p1 · exp(median_h + z_tau · spread_h), z = −1.645/−0.674/0/0.674/1.645. Only the case's hour-1 print and its comparables are used; the program runs offline, deterministically, stdlib only.
 
 ## Backtest (leave-one-out on the kit's 37 comparable launches)
 
 | model | mean pinball loss (all) | big launches (hour-1 ≥ 20k) |
 |---|---|---|
 | persistence baseline (house starter) | 0.930 | 0.321 |
-| **this entry** | **0.399** | **0.280** |
+| **this entry (v2)** | **0.383** | **0.259** |
+
+Server practice score (4 past launches): **0.189** (v1: 0.237; house baseline: 0.387).
 
 ## Run it
 

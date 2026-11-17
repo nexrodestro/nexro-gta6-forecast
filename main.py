@@ -1,35 +1,58 @@
-"""gta6-twitch-ccu-forecast-01 entry: launch-day Twitch viewer forecaster.
+"""gta6-twitch-ccu-forecast-01 entry v2: launch-day Twitch viewer forecaster.
 
 Forecasts, for each of hours 2..24 of a game's UTC release day, five
 quantiles (5/25/50/75/95%) of Twitch concurrent viewers in the game's
 category, anchored on the case's hour-1 print and calibrated on the
 case file's own comparables: past big launches' hourly curves.
 
-Model (chosen by leave-one-out backtest on the kit's 37 comparable
-launches; mean pinball loss 0.39 overall, 0.27 on big launches with
-hour-1 >= 20k viewers, vs 0.93 / 0.32 for the persistence baseline):
+Model v2 (revised 2026-11-17; supersedes the v1 quad+kNN blend):
 
-  The shape of a launch day depends on how big hour 1 already is.
-  Tiny hour-1 launches ramp 10-1000x; mega launches (hour-1 >= 300k)
-  dip to ~half of hour 1 by hour 9-10, then rise to ~1.1x in the
-  evening (hours 17-19) and ease off. Two estimators of the per-hour
-  log-ratio to hour 1 are blended (geometric mean of medians, wider
-  of the two spreads):
-    1. quadratic log-linear regression of log(v_h / v_1) on log10(v_1)
-       across the comparables (captures the size-dependent ramp and
-       saturates at the top end, unlike a plain linear fit);
-    2. size-kNN: the median log-ratio of the 8 comparables whose
-       hour-1 is closest in log terms (captures the mega-launch
-       U-shape directly).
+  Per hour, a quadratic log-linear regression of log(v_h / v_1) on
+  log10(hour-1) across the comparables. The launch-day shape depends
+  on how big hour 1 already is: tiny hour-1 launches ramp 10-1000x;
+  mega launches (hour-1 >= 300k) dip to ~half of hour 1 by hour 9-10,
+  then rise to ~1.1x in the evening (hours 17-19) and ease off. The
+  fit is evaluated at log10(p1) clamped to the calibration range, so
+  a GTA VI hour 1 above the biggest comparable (875k) saturates at
+  the top-end shape instead of extrapolating down.
+
   Quantiles: q_tau(h) = p1 * exp(median_h + z_tau * spread_h), with
-  z = -1.645/-0.674/0/0.674/1.645 and spread_h the residual spread,
-  floored at 0.10 log units.
+  z = -1.645/-0.674/0/0.674/1.645 and spread_h the fit's residual
+  spread scaled by SPREAD_SCALE = 0.55, floored at 0.10 log units.
 
-Only the case's `known` hour-1 print and its `comparables` are used:
-the final case's minute reads, streams and category snapshots are
-not needed (a pre-release level ratio was tested as a second
-regressor and added nothing). Everything is deterministic: no
-randomness, no clock, no network, stdlib only.
+Why v2 beats v1 (validated on the server's practice metric, reproduced
+locally from the competition's own source data, and on leave-one-out
+over the kit's 37 comparables):
+
+  * v1 blended the quad fit 50/50 with a size-kNN median and took the
+    wider of the two spreads. The blend's median was worse than the
+    quad fit alone on every validation set, so v2's median is the pure
+    quad fit. The wider spread, though, earns its keep: taking
+    max(quad residual spread, kNN neighbour spread) x 0.55 is
+    identical to quad-only spread on practice (0.1885 vs 0.1888),
+    big launches (0.2594 vs 0.2597) and mega launches (0.1458 vs
+    0.1458), but much better on small launches (0.7165 vs 0.8301) —
+    insurance if GTA VI's hour 1, or its shape, turns out unlike the
+    mega comparables.
+  * Narrowing the spread to 0.55x was the single biggest win, and it
+    held on every set (not a practice artefact): practice 0.2367 ->
+    0.1885, LOO all 0.3987 -> 0.3829, LOO big launches 0.2800 ->
+    0.2594, LOO console-midnight 0.2245 -> 0.1809. Coverage on
+    practice stays honest at 0.978.
+  * Tried and rejected (all validated the same way): blend weights
+    0.25/0.75 (worse), spread min/mean (worse on LOO), cubic fit
+    (worse), empirical-quantile kNN (much worse on LOO), a per-hour
+    median-bias correction fitted on LOO residuals (practice gain
+    +0.008 but nested-LOO loss -0.012: does not generalise), and
+    similarity weighting (console/midnight) — helps LOO slightly but
+    costs practice; the quad fit already conditions on size.
+  * Server practice score: v1 0.237, v2 0.189 (house baseline 0.387,
+    rival entry 0.197). Every practice case improved: p00 0.290 ->
+    0.185, p01 0.229 -> 0.225, p02 0.210 -> 0.166, p03 0.218 -> 0.179.
+
+Only the case's `known` hour-1 print and its `comparables` are used.
+Everything is deterministic: no randomness, no clock, no network,
+stdlib only.
 
 Run by the grader as `python3 -P -s /bot/main.py` (Python 3.13),
 reading /input/<id>.in and writing /output/<id>.out. Locally:
@@ -56,7 +79,12 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 # Floor on the per-hour log spread: even the most predictable hour
 # keeps an honest minimum width.
 SPREAD_FLOOR = 0.10
-# Size-kNN neighbourhood.
+# Scale on the fit's residual spread. The raw residual spread is far
+# too wide (practice coverage was 4/4 at every hour); 0.55x is the
+# value that won on practice, LOO-all, LOO-big and LOO console-midnight
+# alike (see module docstring). Do not "fix" this back to 1.0.
+SPREAD_SCALE = 0.55
+# Size-kNN neighbourhood for the spread hedge (median stays quad-only).
 KNN_K = 8
 
 
@@ -133,10 +161,10 @@ def solve_linear(matrix, vector):
 
 
 def quad_loglin(curves, h):
-    """Median log-ratio and spread for hour h from a quadratic fit
-    of log-ratio on log10(hour-1) across the curves.
+    """Quadratic fit of log-ratio on log10(hour-1) for hour h.
 
-    Returns (median, spread), or None when too few curves have hour h.
+    Returns (coef, mean_x, feats, ys), or None when too few curves
+    have hour h.
     """
     xs, ys = [], []
     for c in curves:
@@ -165,13 +193,15 @@ def quad_loglin(curves, h):
     return coef, mean_x, feats, ys
 
 
-def quad_loglin_forecast(p1, curves):
+def quad_loglin_forecast(p1, curves, spread_scale=SPREAD_SCALE):
     """Per-hour (median log-ratio, spread) from the quadratic fit.
 
     The fit is evaluated at log10(p1) clamped to the calibration
     range: past the biggest comparable launch there is no evidence
     for a steeper fall, so the top-end launches' own shape is used
-    instead of extrapolating the quadratic further down.
+    instead of extrapolating the quadratic further down. The spread
+    is the fit's residual spread scaled by spread_scale (default
+    SPREAD_SCALE; pass 1.0 for the raw spread).
     """
     out = {}
     logs = [math.log10(c["h1"]) for c in curves]
@@ -185,7 +215,7 @@ def quad_loglin_forecast(p1, curves):
                 continue
             med = statistics.median(ratios)
             spread = statistics.pstdev(ratios) if len(ratios) > 1 else 0.3
-            out[h] = (med, max(SPREAD_FLOOR, spread))
+            out[h] = (med, max(SPREAD_FLOOR, spread * spread_scale))
             continue
         coef, mean_x, feats, ys = fit
         u = log_p1 - mean_x
@@ -193,13 +223,17 @@ def quad_loglin_forecast(p1, curves):
         resid = [y - (coef[0] + coef[1] * f[1] + coef[2] * f[2])
                  for f, y in zip(feats, ys)]
         spread = statistics.pstdev(resid) if len(resid) > 1 else 0.3
-        out[h] = (median, max(SPREAD_FLOOR, spread))
+        out[h] = (median, max(SPREAD_FLOOR, spread * spread_scale))
     return out
 
 
-def knn_forecast(p1, curves):
-    """Per-hour (median log-ratio, spread) from the KNN_K comparables
-    whose hour-1 is closest to p1 in log terms."""
+def knn_spread(p1, curves):
+    """Per-hour raw log-spread from the KNN_K comparables whose hour-1
+    is closest to p1 in log terms. Used only as a hedge inside the
+    spread (see forecast_case): small launches have wildly different
+    shapes, and their neighbour spread is the honest width there,
+    where the quad fit's residual spread is too narrow.
+    """
     log_p1 = math.log(p1)
     near = sorted(curves, key=lambda c: abs(math.log(c["h1"]) - log_p1))
     near = near[:KNN_K] if len(near) > KNN_K else near
@@ -208,12 +242,8 @@ def knn_forecast(p1, curves):
         ratios = hour_log_ratios(near, h)
         if not ratios:
             ratios = hour_log_ratios(curves, h)
-        if not ratios:
-            out[h] = (0.0, SPREAD_FLOOR)
-            continue
-        med = statistics.median(ratios)
         spread = statistics.pstdev(ratios) if len(ratios) > 1 else 0.3
-        out[h] = (med, max(SPREAD_FLOOR, spread))
+        out[h] = spread
     return out
 
 
@@ -256,13 +286,12 @@ def forecast_case(case, name):
         p1 = max(1.0, float(first["viewers"]))
     curves = parse_comparables(case)
     if len(curves) >= 10:
-        quad = quad_loglin_forecast(p1, curves)
-        knn = knn_forecast(p1, curves)
+        quad = quad_loglin_forecast(p1, curves, spread_scale=1.0)
+        knn_sp = knn_spread(p1, curves)
         blended = {}
         for h in range(2, 25):
-            med = (quad[h][0] + knn[h][0]) / 2.0
-            spread = max(quad[h][1], knn[h][1])
-            blended[h] = (med, spread)
+            spread = max(quad[h][1], knn_sp[h]) * SPREAD_SCALE
+            blended[h] = (quad[h][0], max(SPREAD_FLOOR, spread))
     else:
         blended = persistence_forecast(p1)
     return {"hours": [{"hour": row["hour"],
